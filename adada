@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>터널 러너 3D</title>
+<style>
+  :root { --bg:#08091a; --ink:#eef0ff; --dim:#9aa0c8; --accent:#6ee7ff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; min-height:100%; background:var(--bg); color:var(--ink);
+    font-family:"Pretendard","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:14px; min-height:100vh; }
+  h1 { margin:0; font-size:19px; letter-spacing:.1em; font-weight:800; }
+  h1 span { color:var(--accent); }
+  #wrap { width:100%; max-width:980px; position:relative; }
+  canvas { cursor:crosshair; display:block; width:100%; aspect-ratio:16/10; max-height:74vh; border-radius:14px; background:#08091a;
+    box-shadow:0 12px 40px rgba(0,0,0,.6); touch-action:none; user-select:none; }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 14px; justify-content:center; font-size:13px; color:var(--dim); max-width:980px; }
+  .legend b { color:var(--ink); font-weight:600; }
+  .help { font-size:13px; color:var(--dim); text-align:center; line-height:1.7; }
+  kbd { background:#1c2050; border-radius:5px; padding:1px 7px; color:var(--ink); font-family:inherit; font-size:12px; }
+  #pad { display:none; width:100%; max-width:980px; gap:10px; }
+  #pad button { flex:1; height:64px; border:0; border-radius:14px; background:#1c2050; color:var(--ink); font-size:22px; font-weight:700;
+    touch-action:none; user-select:none; -webkit-user-select:none; }
+  #pad button:active { background:#2c3280; }
+  @media (pointer:coarse) { #pad { display:flex; } }
+</style>
+</head>
+<body>
+<h1>터널 <span>러너 3D</span></h1>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="pad">
+  <button id="bl">◀</button><button id="bj">점프</button><button id="br">▶</button>
+</div>
+<div class="legend">
+  <span>💎 <b>크리스탈</b> +10점</span>
+  <span>🛡️ <b>보호막</b> 떨어져도 한 번 구조</span>
+  <span>🌉 <b>다리</b> 6초간 구멍이 메워짐</span>
+  <span>🧲 <b>자석</b> 근처 크리스탈 자동 획득</span>
+  <span>⏱️ <b>슬로우</b> 5초간 감속</span>
+  <span>✖️2 <b>2배</b> 8초간 점수 두 배</span>
+</div>
+<div class="help">
+  <b style="color:#eef0ff">마우스</b>: 커서 쪽으로 이동, 클릭 = 점프 · <b style="color:#eef0ff">키보드</b>: <kbd>←</kbd> <kbd>→</kbd> 이동, <kbd>Space</kbd> 점프 · <kbd>P</kbd> 일시정지<br>
+  벽 쪽으로 계속 가면 <b style="color:#eef0ff">벽이 바닥이 되며 터널이 회전</b>합니다. 구멍으로 떨어지면 끝!
+</div>
+
+<script>
+(() => {
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 800, H = 500, F = 425;
+function fit() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth || 800; H = cv.clientHeight || 500; F = H * 0.85;
+  cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+fit(); addEventListener('resize', fit);
+
+/* ---------- 상수 ---------- */
+const A = 2.5;          // 터널 반폭 (한 면에 5칸)
+const L = 2;            // 타일 한 줄의 길이
+const NEAR = 0.3, VIEW_ROWS = 38, FOG = 74;
+const CAM_BACK = 4.5, CAM_UP = 1.7;
+const FACE_RGB = [[92, 112, 255], [150, 96, 240], [64, 170, 226], [204, 104, 196]];
+const BG = [8, 9, 26];
+const POWER = {
+  shield: { icon: '🛡️', color: '#5ad1ff', name: '보호막' },
+  bridge: { icon: '🌉', color: '#6ee7ff', name: '다리', time: 6 },
+  magnet: { icon: '🧲', color: '#ff6b81', name: '자석', time: 8 },
+  slow:   { icon: '⏱️', color: '#9d8cff', name: '슬로우', time: 5 },
+  double: { icon: '✖️2', color: '#6ee7a0', name: '2배', time: 8 },
+};
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rot = (k, x, y) => k === 0 ? [x, y] : k === 1 ? [-y, x] : k === 2 ? [-x, -y] : [y, -x];
+
+/* ---------- 저장 / 소리 ---------- */
+let best = 0;
+try { best = +localStorage.getItem('tunnel-best') || 0; } catch (e) {}
+function saveBest() { try { localStorage.setItem('tunnel-best', best); } catch (e) {} }
+let ac = null;
+function beep(freq, dur = 0.08, type = 'square', vol = 0.05, slide = 0) {
+  try {
+    if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur);
+  } catch (e) {}
+}
+
+/* ---------- 상태 ---------- */
+let state = 'ready', paused = false, overAt = 0, time = 0, t0 = 0;
+let p, face, turns, roll, cam, rows, rowItems, gh, gs, crystalRun, nextPower;
+let fx, score, crystals, speed, popups, flash;
+const keys = { l: false, r: false };
+const mouse = { on: false, x: 0 };
+const stars = Array.from({ length: 140 }, () => ({ a: rand(0, 6.283), d: rand(.05, 1.2), r: rand(.5, 1.7), tw: rand(0, 6) }));
+
+function reset() {
+  p = { x: 0, y: 0, z: 3, vy: 0, ground: true, coyote: 0, fallen: false, held: false, run: 0 };
+  face = 0; turns = 0; roll = 0; cam = { x: 0, y: -A + CAM_UP };
+  rows = []; rowItems = [];
+  gh = [0, 1, 2, 3].map(() => [0, 0, 0, 0, 0]); gs = [0, 1, 2, 3].map(() => [9, 9, 9, 9, 9]);
+  crystalRun = { f: 0, c: 2, left: 0 }; nextPower = 22;
+  fx = { shield: false, bridge: 0, magnet: 0, slow: 0, double: 0 };
+  score = 0; crystals = 0; speed = 9; popups = []; flash = 0;
+}
+
+/* ---------- 터널 생성 ---------- */
+function pickFace() {           // 플레이어가 닿기 쉬운 면 위주로
+  const r = Math.random();
+  return (face + (r < .5 ? 0 : r < .7 ? 1 : r < .9 ? 3 : 2)) & 3;
+}
+function genRow() {
+  const r = rows.length, row = new Uint8Array(20), its = [];
+  if (r < 12) row.fill(1);
+  else {
+    const d = Math.min(1, (r - 12) / 450), prob = 0.09 + 0.2 * d;
+    for (let f = 0; f < 4; f++) {
+      if (Math.random() < prob) {
+        const a = Math.floor(rand(0, 5)), w = 1 + Math.floor(Math.random() * (Math.random() < .25 ? 5 : 3));
+        let len = Math.random() < .45 + .3 * d ? 2 : 1;
+        if (d > .5 && Math.random() < .2) len = 3;
+        for (let c = a; c < Math.min(5, a + w); c++) if (gs[f][c] >= 3 && gh[f][c] === 0) gh[f][c] = len;
+      }
+      for (let c = 0; c < 5; c++) {
+        if (gh[f][c] > 0) { gh[f][c]--; gs[f][c] = 0; } else { gs[f][c]++; row[f * 5 + c] = 1; }
+      }
+    }
+    if (crystalRun.left > 0) { its.push({ kind: 'crystal', f: crystalRun.f, c: crystalRun.c, h: .55 }); crystalRun.left--; }
+    else if (Math.random() < .13) crystalRun = { f: pickFace(), c: Math.floor(rand(0, 5)), left: 3 + Math.floor(rand(0, 3)) };
+    if (--nextPower <= 0) {
+      nextPower = 26 + Math.floor(rand(0, 20));
+      let pool = ['shield', 'bridge', 'magnet', 'slow', 'double'];
+      if (fx && fx.shield) pool = pool.filter(k => k !== 'shield');
+      its.push({ kind: pool[Math.floor(Math.random() * pool.length)], f: pickFace(), c: Math.floor(rand(0, 5)), h: .7 });
+    }
+  }
+  rows.push(row); rowItems.push(its);
+}
+function tileAt(f, c, r) {
+  if (r < 0) return true;
+  while (rows.length <= r) genRow();
+  return rows[r][(f & 3) * 5 + c] === 1;
+}
+const solid = (f, c, r) => fx.bridge > 0 || tileAt(f, c, r);
+reset();
+
+/* ---------- 입력 ---------- */
+function jump() {
+  if (state === 'ready') { state = 'playing'; beep(520, .1, 'triangle'); return; }
+  if (state === 'over') { if (performance.now() - overAt > 600) { reset(); state = 'playing'; } return; }
+  if (paused) { paused = false; return; }
+  if ((p.ground || p.coyote > 0) && !p.fallen) {
+    p.vy = 8; p.ground = false; p.coyote = 0; p.held = true; beep(440, .09, 'square', .04, 220);
+  }
+}
+function release() { p.held = false; if (p.vy > 3.2) p.vy = 3.2; }
+addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) { e.preventDefault(); if (!e.repeat) jump(); }
+  else if (e.code === 'ArrowLeft' || e.code === 'KeyA') { e.preventDefault(); keys.l = true; mouse.on = false; }
+  else if (e.code === 'ArrowRight' || e.code === 'KeyD') { e.preventDefault(); keys.r = true; mouse.on = false; }
+  else if (e.code === 'KeyP' && state === 'playing') paused = !paused;
+});
+addEventListener('keyup', e => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) release();
+  else if (e.code === 'ArrowLeft' || e.code === 'KeyA') keys.l = false;
+  else if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.r = false;
+});
+cv.addEventListener('pointerdown', e => { e.preventDefault(); jump(); });
+addEventListener('pointermove', e => {
+  if (e.pointerType !== 'mouse') return;
+  const b = cv.getBoundingClientRect();
+  mouse.on = true; mouse.x = (e.clientX - b.left) * (W / b.width);
+});
+addEventListener('pointerup', release);
+addEventListener('blur', () => { keys.l = keys.r = false; if (state === 'playing') paused = true; });
+function hold(id, on, off) {
+  const b = document.getElementById(id);
+  b.addEventListener('pointerdown', e => { e.preventDefault(); on(); });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, off);
+}
+hold('bl', () => keys.l = true, () => keys.l = false);
+hold('br', () => keys.r = true, () => keys.r = false);
+hold('bj', jump, release);
+
+/* ---------- 로직 ---------- */
+const mult = () => (fx.double > 0 ? 2 : 1);
+function popup(text, color) { popups.push({ text, color, t: 0 }); }
+
+function turn(dir) {            // dir=+1: 오른쪽 벽이 바닥으로, -1: 왼쪽 벽
+  const h = Math.max(p.y, 0);
+  if (dir > 0) { p.x = Math.max(-A + h, -A + 0.3); cam = { x: cam.y, y: -cam.x }; roll += Math.PI / 2; }
+  else         { p.x = Math.min(A - h, A - 0.3);   cam = { x: -cam.y, y: cam.x }; roll -= Math.PI / 2; }
+  p.y = 0; p.vy = 0; p.ground = true;
+  face = (face + (dir > 0 ? 1 : 3)) & 3; turns += dir;
+  beep(300, .07, 'triangle', .04, 120);
+}
+
+function collect(it) {
+  it.got = true;
+  if (it.kind === 'crystal') { crystals++; score += 10 * mult(); beep(900, .06, 'square', .035, 320); return; }
+  const d = POWER[it.kind];
+  if (it.kind === 'shield') fx.shield = true; else fx[it.kind] = d.time;
+  popup(d.icon + ' ' + d.name + '!', d.color); flash = .25;
+  beep(520, .08, 'triangle', .06); setTimeout(() => beep(780, .12, 'triangle', .06), 80);
+}
+
+function die() {
+  if (fx.shield) {              // 구조: 터널 안으로 되돌리고 잠깐 다리를 깔아줌
+    fx.shield = false; fx.bridge = Math.max(fx.bridge, 3);
+    p.x = clamp(p.x, -A + .5, A - .5); p.y = 1.6; p.vy = 0; p.fallen = false;
+    popup('🛡️ 구조 성공!', '#5ad1ff'); flash = .4; beep(700, .2, 'triangle', .06, -350); return;
+  }
+  state = 'over'; overAt = performance.now(); beep(160, .35, 'sawtooth', .07, -110);
+  if (Math.floor(score) > best) { best = Math.floor(score); saveBest(); }
+}
+
+function update(dt) {
+  time += dt;
+  for (const k of ['bridge', 'magnet', 'slow', 'double']) if (fx[k] > 0) fx[k] = Math.max(0, fx[k] - dt);
+  if (flash > 0) flash -= dt;
+
+  speed = Math.min(17, 9 + p.z / 260);
+  const v = speed * (fx.slow > 0 ? .6 : 1), dz = v * dt;
+  p.z += dz; score += dz * 0.5 * mult(); p.run += dz * 2.2;
+  let dir = (keys.r ? 1 : 0) - (keys.l ? 1 : 0);
+  if (!dir && mouse.on) {         // 마우스: 커서가 있는 쪽으로 따라감
+    const d = mouse.x - (W / 2 + (p.x - cam.x) * F / CAM_BACK);
+    if (Math.abs(d) > 5) dir = clamp(d / 28, -1, 1);
+  }
+  p.x += dir * 9.5 * dt;
+  p.vy -= 22 * dt; p.y += p.vy * dt;
+  if (p.coyote > 0) p.coyote -= dt;
+
+  const r = Math.floor(p.z / L), wasGround = p.ground;
+  p.ground = false;
+  if (!p.fallen) {
+    if (p.x > A - .25 && p.y > -.2) {
+      if (solid(face + 1, clamp(Math.floor(p.y), 0, 4), r)) turn(1);
+      else if (p.x > A + .1) p.fallen = true;
+    } else if (p.x < -A + .25 && p.y > -.2) {
+      if (solid(face + 3, clamp(4 - Math.floor(p.y), 0, 4), r)) turn(-1);
+      else if (p.x < -A - .1) p.fallen = true;
+    }
+    if (!p.fallen && p.y <= 0) {
+      const inside = p.x >= -A && p.x <= A;
+      if (inside && solid(face,
