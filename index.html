@@ -1,0 +1,465 @@
+
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>터널 러너 3D</title>
+<style>
+  :root { --bg:#08091a; --ink:#eef0ff; --dim:#9aa0c8; --accent:#6ee7ff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; min-height:100%; background:var(--bg); color:var(--ink);
+    font-family:"Pretendard","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif; }
+  body { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px; padding:14px; min-height:100vh; }
+  h1 { margin:0; font-size:19px; letter-spacing:.1em; font-weight:800; }
+  h1 span { color:var(--accent); }
+  #wrap { width:100%; max-width:980px; position:relative; }
+  canvas { cursor:crosshair; display:block; width:100%; aspect-ratio:16/10; max-height:74vh; border-radius:14px; background:#08091a;
+    box-shadow:0 12px 40px rgba(0,0,0,.6); touch-action:none; user-select:none; }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 14px; justify-content:center; font-size:13px; color:var(--dim); max-width:980px; }
+  .legend b { color:var(--ink); font-weight:600; }
+  .help { font-size:13px; color:var(--dim); text-align:center; line-height:1.7; }
+  kbd { background:#1c2050; border-radius:5px; padding:1px 7px; color:var(--ink); font-family:inherit; font-size:12px; }
+  #pad { display:none; width:100%; max-width:980px; gap:10px; }
+  #pad button { flex:1; height:64px; border:0; border-radius:14px; background:#1c2050; color:var(--ink); font-size:22px; font-weight:700;
+    touch-action:none; user-select:none; -webkit-user-select:none; }
+  #pad button:active { background:#2c3280; }
+  @media (pointer:coarse) { #pad { display:flex; } }
+</style>
+</head>
+<body>
+<h1>터널 <span>러너 3D</span></h1>
+<div id="wrap"><canvas id="c"></canvas></div>
+<div id="pad">
+  <button id="bl">◀</button><button id="bj">점프</button><button id="br">▶</button>
+</div>
+<div class="legend">
+  <span>💎 <b>크리스탈</b> +10점</span>
+  <span>🛡️ <b>보호막</b> 떨어져도 한 번 구조</span>
+  <span>🌉 <b>다리</b> 6초간 구멍이 메워짐</span>
+  <span>🧲 <b>자석</b> 근처 크리스탈 자동 획득</span>
+  <span>⏱️ <b>슬로우</b> 5초간 감속</span>
+  <span>✖️2 <b>2배</b> 8초간 점수 두 배</span>
+</div>
+<div class="help">
+  <b style="color:#eef0ff">마우스</b>: 커서 쪽으로 이동, 클릭 = 점프 · <b style="color:#eef0ff">키보드</b>: <kbd>←</kbd> <kbd>→</kbd> 이동, <kbd>Space</kbd> 점프 · <kbd>P</kbd> 일시정지<br>
+  벽 쪽으로 계속 가면 <b style="color:#eef0ff">벽이 바닥이 되며 터널이 회전</b>합니다. 구멍으로 떨어지면 끝!
+</div>
+
+<script>
+(() => {
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 800, H = 500, F = 425;
+function fit() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = cv.clientWidth || 800; H = cv.clientHeight || 500; F = H * 0.85;
+  cv.width = W * dpr; cv.height = H * dpr; ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+fit(); addEventListener('resize', fit);
+
+/* ---------- 상수 ---------- */
+const A = 2.5;          // 터널 반폭 (한 면에 5칸)
+const L = 2;            // 타일 한 줄의 길이
+const NEAR = 0.3, VIEW_ROWS = 38, FOG = 74;
+const CAM_BACK = 4.5, CAM_UP = 1.7;
+const FACE_RGB = [[92, 112, 255], [150, 96, 240], [64, 170, 226], [204, 104, 196]];
+const BG = [8, 9, 26];
+const POWER = {
+  shield: { icon: '🛡️', color: '#5ad1ff', name: '보호막' },
+  bridge: { icon: '🌉', color: '#6ee7ff', name: '다리', time: 6 },
+  magnet: { icon: '🧲', color: '#ff6b81', name: '자석', time: 8 },
+  slow:   { icon: '⏱️', color: '#9d8cff', name: '슬로우', time: 5 },
+  double: { icon: '✖️2', color: '#6ee7a0', name: '2배', time: 8 },
+};
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rot = (k, x, y) => k === 0 ? [x, y] : k === 1 ? [-y, x] : k === 2 ? [-x, -y] : [y, -x];
+
+/* ---------- 저장 / 소리 ---------- */
+let best = 0;
+try { best = +localStorage.getItem('tunnel-best') || 0; } catch (e) {}
+function saveBest() { try { localStorage.setItem('tunnel-best', best); } catch (e) {} }
+let ac = null;
+function beep(freq, dur = 0.08, type = 'square', vol = 0.05, slide = 0) {
+  try {
+    if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime;
+    o.type = type; o.frequency.setValueAtTime(freq, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(40, freq + slide), t + dur);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur);
+  } catch (e) {}
+}
+
+/* ---------- 상태 ---------- */
+let state = 'ready', paused = false, overAt = 0, time = 0, t0 = 0;
+let p, face, turns, roll, cam, rows, rowItems, gh, gs, crystalRun, nextPower;
+let fx, score, crystals, speed, popups, flash;
+const keys = { l: false, r: false };
+const mouse = { on: false, x: 0 };
+const stars = Array.from({ length: 140 }, () => ({ a: rand(0, 6.283), d: rand(.05, 1.2), r: rand(.5, 1.7), tw: rand(0, 6) }));
+
+function reset() {
+  p = { x: 0, y: 0, z: 3, vy: 0, ground: true, coyote: 0, fallen: false, held: false, run: 0 };
+  face = 0; turns = 0; roll = 0; cam = { x: 0, y: -A + CAM_UP };
+  rows = []; rowItems = [];
+  gh = [0, 1, 2, 3].map(() => [0, 0, 0, 0, 0]); gs = [0, 1, 2, 3].map(() => [9, 9, 9, 9, 9]);
+  crystalRun = { f: 0, c: 2, left: 0 }; nextPower = 22;
+  fx = { shield: false, bridge: 0, magnet: 0, slow: 0, double: 0 };
+  score = 0; crystals = 0; speed = 9; popups = []; flash = 0;
+}
+
+/* ---------- 터널 생성 ---------- */
+function pickFace() {           // 플레이어가 닿기 쉬운 면 위주로
+  const r = Math.random();
+  return (face + (r < .5 ? 0 : r < .7 ? 1 : r < .9 ? 3 : 2)) & 3;
+}
+function genRow() {
+  const r = rows.length, row = new Uint8Array(20), its = [];
+  if (r < 12) row.fill(1);
+  else {
+    const d = Math.min(1, (r - 12) / 450), prob = 0.09 + 0.2 * d;
+    for (let f = 0; f < 4; f++) {
+      if (Math.random() < prob) {
+        const a = Math.floor(rand(0, 5)), w = 1 + Math.floor(Math.random() * (Math.random() < .25 ? 5 : 3));
+        let len = Math.random() < .45 + .3 * d ? 2 : 1;
+        if (d > .5 && Math.random() < .2) len = 3;
+        for (let c = a; c < Math.min(5, a + w); c++) if (gs[f][c] >= 3 && gh[f][c] === 0) gh[f][c] = len;
+      }
+      for (let c = 0; c < 5; c++) {
+        if (gh[f][c] > 0) { gh[f][c]--; gs[f][c] = 0; } else { gs[f][c]++; row[f * 5 + c] = 1; }
+      }
+    }
+    if (crystalRun.left > 0) { its.push({ kind: 'crystal', f: crystalRun.f, c: crystalRun.c, h: .55 }); crystalRun.left--; }
+    else if (Math.random() < .13) crystalRun = { f: pickFace(), c: Math.floor(rand(0, 5)), left: 3 + Math.floor(rand(0, 3)) };
+    if (--nextPower <= 0) {
+      nextPower = 26 + Math.floor(rand(0, 20));
+      let pool = ['shield', 'bridge', 'magnet', 'slow', 'double'];
+      if (fx && fx.shield) pool = pool.filter(k => k !== 'shield');
+      its.push({ kind: pool[Math.floor(Math.random() * pool.length)], f: pickFace(), c: Math.floor(rand(0, 5)), h: .7 });
+    }
+  }
+  rows.push(row); rowItems.push(its);
+}
+function tileAt(f, c, r) {
+  if (r < 0) return true;
+  while (rows.length <= r) genRow();
+  return rows[r][(f & 3) * 5 + c] === 1;
+}
+const solid = (f, c, r) => fx.bridge > 0 || tileAt(f, c, r);
+reset();
+
+/* ---------- 입력 ---------- */
+function jump() {
+  if (state === 'ready') { state = 'playing'; beep(520, .1, 'triangle'); return; }
+  if (state === 'over') { if (performance.now() - overAt > 600) { reset(); state = 'playing'; } return; }
+  if (paused) { paused = false; return; }
+  if ((p.ground || p.coyote > 0) && !p.fallen) {
+    p.vy = 8; p.ground = false; p.coyote = 0; p.held = true; beep(440, .09, 'square', .04, 220);
+  }
+}
+function release() { p.held = false; if (p.vy > 3.2) p.vy = 3.2; }
+addEventListener('keydown', e => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) { e.preventDefault(); if (!e.repeat) jump(); }
+  else if (e.code === 'ArrowLeft' || e.code === 'KeyA') { e.preventDefault(); keys.l = true; mouse.on = false; }
+  else if (e.code === 'ArrowRight' || e.code === 'KeyD') { e.preventDefault(); keys.r = true; mouse.on = false; }
+  else if (e.code === 'KeyP' && state === 'playing') paused = !paused;
+});
+addEventListener('keyup', e => {
+  if (['Space', 'ArrowUp', 'KeyW'].includes(e.code)) release();
+  else if (e.code === 'ArrowLeft' || e.code === 'KeyA') keys.l = false;
+  else if (e.code === 'ArrowRight' || e.code === 'KeyD') keys.r = false;
+});
+cv.addEventListener('pointerdown', e => { e.preventDefault(); jump(); });
+addEventListener('pointermove', e => {
+  if (e.pointerType !== 'mouse') return;
+  const b = cv.getBoundingClientRect();
+  mouse.on = true; mouse.x = (e.clientX - b.left) * (W / b.width);
+});
+addEventListener('pointerup', release);
+addEventListener('blur', () => { keys.l = keys.r = false; if (state === 'playing') paused = true; });
+function hold(id, on, off) {
+  const b = document.getElementById(id);
+  b.addEventListener('pointerdown', e => { e.preventDefault(); on(); });
+  for (const ev of ['pointerup', 'pointerleave', 'pointercancel']) b.addEventListener(ev, off);
+}
+hold('bl', () => keys.l = true, () => keys.l = false);
+hold('br', () => keys.r = true, () => keys.r = false);
+hold('bj', jump, release);
+
+/* ---------- 로직 ---------- */
+const mult = () => (fx.double > 0 ? 2 : 1);
+function popup(text, color) { popups.push({ text, color, t: 0 }); }
+
+function turn(dir) {            // dir=+1: 오른쪽 벽이 바닥으로, -1: 왼쪽 벽
+  const h = Math.max(p.y, 0);
+  if (dir > 0) { p.x = Math.max(-A + h, -A + 0.3); cam = { x: cam.y, y: -cam.x }; roll += Math.PI / 2; }
+  else         { p.x = Math.min(A - h, A - 0.3);   cam = { x: -cam.y, y: cam.x }; roll -= Math.PI / 2; }
+  p.y = 0; p.vy = 0; p.ground = true;
+  face = (face + (dir > 0 ? 1 : 3)) & 3; turns += dir;
+  beep(300, .07, 'triangle', .04, 120);
+}
+
+function collect(it) {
+  it.got = true;
+  if (it.kind === 'crystal') { crystals++; score += 10 * mult(); beep(900, .06, 'square', .035, 320); return; }
+  const d = POWER[it.kind];
+  if (it.kind === 'shield') fx.shield = true; else fx[it.kind] = d.time;
+  popup(d.icon + ' ' + d.name + '!', d.color); flash = .25;
+  beep(520, .08, 'triangle', .06); setTimeout(() => beep(780, .12, 'triangle', .06), 80);
+}
+
+function die() {
+  if (fx.shield) {              // 구조: 터널 안으로 되돌리고 잠깐 다리를 깔아줌
+    fx.shield = false; fx.bridge = Math.max(fx.bridge, 3);
+    p.x = clamp(p.x, -A + .5, A - .5); p.y = 1.6; p.vy = 0; p.fallen = false;
+    popup('🛡️ 구조 성공!', '#5ad1ff'); flash = .4; beep(700, .2, 'triangle', .06, -350); return;
+  }
+  state = 'over'; overAt = performance.now(); beep(160, .35, 'sawtooth', .07, -110);
+  if (Math.floor(score) > best) { best = Math.floor(score); saveBest(); }
+}
+
+function update(dt) {
+  time += dt;
+  for (const k of ['bridge', 'magnet', 'slow', 'double']) if (fx[k] > 0) fx[k] = Math.max(0, fx[k] - dt);
+  if (flash > 0) flash -= dt;
+
+  speed = Math.min(17, 9 + p.z / 260);
+  const v = speed * (fx.slow > 0 ? .6 : 1), dz = v * dt;
+  p.z += dz; score += dz * 0.5 * mult(); p.run += dz * 2.2;
+  let dir = (keys.r ? 1 : 0) - (keys.l ? 1 : 0);
+  if (!dir && mouse.on) {         // 마우스: 커서가 있는 쪽으로 따라감
+    const d = mouse.x - (W / 2 + (p.x - cam.x) * F / CAM_BACK);
+    if (Math.abs(d) > 5) dir = clamp(d / 28, -1, 1);
+  }
+  p.x += dir * 9.5 * dt;
+  p.vy -= 22 * dt; p.y += p.vy * dt;
+  if (p.coyote > 0) p.coyote -= dt;
+
+  const r = Math.floor(p.z / L), wasGround = p.ground;
+  p.ground = false;
+  if (!p.fallen) {
+    if (p.x > A - .25 && p.y > -.2) {
+      if (solid(face + 1, clamp(Math.floor(p.y), 0, 4), r)) turn(1);
+      else if (p.x > A + .1) p.fallen = true;
+    } else if (p.x < -A + .25 && p.y > -.2) {
+      if (solid(face + 3, clamp(4 - Math.floor(p.y), 0, 4), r)) turn(-1);
+      else if (p.x < -A - .1) p.fallen = true;
+    }
+    if (!p.fallen && p.y <= 0) {
+      const inside = p.x >= -A && p.x <= A;
+      if (inside && solid(face, clamp(Math.floor(p.x + A), 0, 4), r)) {
+        if (p.vy <= 0) { p.y = 0; p.vy = 0; p.ground = true; }
+      } else if (p.y < -.3) p.fallen = true;
+    }
+    if (wasGround && !p.ground && p.vy <= 0) p.coyote = .09;
+  }
+  if (p.y < -5 || Math.abs(p.x) > A + 4) { die(); if (state === 'over') return; }
+
+  // 아이템
+  const px = p.x, py = -A + p.y + .45;
+  for (let rr = Math.max(0, r - 1); rr <= r + 1; rr++) {
+    tileAt(0, 0, rr);
+    for (const it of rowItems[rr]) {
+      if (it.got) continue;
+      const [ix, iy] = rot((it.f - face) & 3, -A + it.c + .5, -A + it.h);
+      const ddz = (rr + .5) * L - p.z, dd = Math.hypot(ix - px, iy - py);
+      if (Math.hypot(dd, ddz) < .85) collect(it);
+      else if (it.kind === 'crystal' && fx.magnet > 0 && Math.abs(ddz) < 1.3 && dd < 4.2) collect(it);
+    }
+  }
+
+  // 카메라
+  const k = 1 - Math.exp(-11 * dt);
+  cam.x += (p.x * .55 - cam.x) * k;
+  cam.y += (-A + CAM_UP + clamp(p.y, -1.5, 3) * .45 - cam.y) * k;
+  roll *= Math.exp(-17 * dt);
+  for (const q of popups) q.t += dt;
+  popups = popups.filter(q => q.t < 1.1);
+}
+
+/* ---------- 그리기 ---------- */
+let cr = 1, sr = 0, camZ = 0;
+function proj(X, Y, z) {        // 현재 프레임 좌표 → 화면
+  const dx = X - cam.x, dy = Y - cam.y, s = F / Math.max(NEAR, z - camZ);
+  return [W / 2 + (dx * cr - dy * sr) * s, H * .42 - (dx * sr + dy * cr) * s, s];
+}
+
+function drawBg() {
+  ctx.fillStyle = '#08091a'; ctx.fillRect(0, 0, W, H);
+  const ang = -turns * Math.PI / 2 + roll + time * .02, R = Math.hypot(W, H) / 2;
+  ctx.fillStyle = '#fff';
+  for (const s of stars) {
+    const a = s.a + ang;
+    ctx.globalAlpha = .35 + .65 * Math.abs(Math.sin(time * 1.3 + s.tw));
+    ctx.beginPath(); ctx.arc(W / 2 + Math.cos(a) * s.d * R, H * .42 - Math.sin(a) * s.d * R, s.r, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawPlayer() {
+  const [sx, sy, s] = proj(p.x, -A + p.y, p.z);
+  const r = Math.floor(p.z / L), lane = Math.floor(p.x + A);
+  if (!p.fallen && p.y >= 0 && lane >= 0 && lane < 5 && solid(face, lane, r)) {
+    const [hx, hy] = proj(p.x, -A, p.z);
+    ctx.save(); ctx.translate(hx, hy); ctx.rotate(-roll);
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; const k = 1 / (1 + p.y * .6);
+    ctx.beginPath(); ctx.ellipse(0, 0, .3 * s * k, .1 * s * k, 0, 0, 7); ctx.fill(); ctx.restore();
+  }
+  ctx.save(); ctx.translate(sx, sy); ctx.rotate(-roll);
+  const u = s;                         // 1 유닛당 픽셀
+  // 다리
+  ctx.strokeStyle = '#eef0ff'; ctx.lineWidth = Math.max(2, .07 * u); ctx.lineCap = 'round';
+  const sw = p.ground ? Math.sin(p.run) * .1 * u : .05 * u, lift = p.ground ? Math.abs(Math.cos(p.run)) * .05 * u : .08 * u;
+  ctx.beginPath();
+  ctx.moveTo(-.1 * u, -.25 * u); ctx.lineTo(-.1 * u - sw * .3, -lift * (sw > 0 ? 1 : 0));
+  ctx.moveTo(.1 * u, -.25 * u); ctx.lineTo(.1 * u + sw * .3, -lift * (sw > 0 ? 0 : 1));
+  ctx.stroke();
+  // 몸통
+  ctx.fillStyle = '#ffb347'; ctx.beginPath(); ctx.ellipse(0, -.52 * u, .27 * u, .31 * u, 0, 0, 7); ctx.fill();
+  // 배낭
+  ctx.fillStyle = '#e8eaff'; ctx.beginPath(); ctx.roundRect(-.15 * u, -.62 * u, .3 * u, .28 * u, .06 * u); ctx.fill();
+  ctx.fillStyle = '#6ee7ff'; ctx.fillRect(-.09 * u, -.55 * u, .18 * u, .05 * u);
+  // 안테나
+  ctx.strokeStyle = '#e8eaff'; ctx.lineWidth = Math.max(1.5, .035 * u);
+  ctx.beginPath(); ctx.moveTo(0, -.82 * u); ctx.lineTo(0, -1.0 * u); ctx.stroke();
+  ctx.fillStyle = '#6ee7ff'; ctx.shadowColor = '#6ee7ff'; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.arc(0, -1.03 * u, .055 * u, 0, 7); ctx.fill(); ctx.shadowBlur = 0;
+  if (fx.shield) {
+    ctx.strokeStyle = '#5ad1ff'; ctx.lineWidth = 2.5; ctx.globalAlpha = .55 + .3 * Math.sin(time * 6);
+    ctx.beginPath(); ctx.arc(0, -.5 * u, .62 * u, 0, 7); ctx.stroke();
+    ctx.fillStyle = 'rgba(90,209,255,.12)'; ctx.fill(); ctx.globalAlpha = 1;
+  }
+  if (fx.magnet > 0) {
+    ctx.strokeStyle = 'rgba(255,107,129,.4)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, -.5 * u, (.7 + (time * 1.2) % .6) * u, 0, 7); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawItem(it, r) {
+  const k = (it.f - face) & 3, bob = Math.sin(time * 4 + r) * .08;
+  const [ix, iy] = rot(k, -A + it.c + .5, -A + it.h + bob);
+  const z = (r + .5) * L; if (z - camZ < NEAR + .2) return;
+  const [sx, sy, s] = proj(ix, iy, z);
+  const fog = clamp(1 - (z - camZ) / FOG, 0, 1);
+  ctx.save(); ctx.translate(sx, sy); ctx.rotate(-roll - k * Math.PI / 2 * 0); ctx.globalAlpha = Math.min(1, fog * 1.6);
+  if (it.kind === 'crystal') {
+    const w = .2 * s * (Math.abs(Math.cos(time * 3 + r)) * .7 + .3), h = .3 * s;
+    ctx.fillStyle = '#7df9ff'; ctx.shadowColor = '#7df9ff'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.moveTo(0, -h); ctx.lineTo(w, 0); ctx.lineTo(0, h); ctx.lineTo(-w, 0); ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(255,255,255,.7)';
+    ctx.beginPath(); ctx.moveTo(0, -h); ctx.lineTo(w * .4, 0); ctx.lineTo(0, h * .3); ctx.lineTo(-w * .2, 0); ctx.closePath(); ctx.fill();
+  } else {
+    const d = POWER[it.kind], R = .36 * s;
+    ctx.shadowColor = d.color; ctx.shadowBlur = 20;
+    ctx.fillStyle = '#10123a'; ctx.strokeStyle = d.color; ctx.lineWidth = Math.max(2, .05 * s);
+    ctx.beginPath(); ctx.arc(0, 0, R, 0, 7); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+    if (R > 5) {
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#fff';
+      ctx.font = Math.round(R * (it.kind === 'double' ? .7 : 1.05)) + 'px sans-serif';
+      ctx.fillText(d.icon, 0, R * .06);
+    }
+  }
+  ctx.restore();
+}
+
+const pts = [0, 1, 2, 3].map(() => new Float32Array(12));
+function drawTunnel() {
+  cr = Math.cos(roll); sr = Math.sin(roll); camZ = p.z - CAM_BACK;
+  for (let k = 0; k < 4; k++) for (let i = 0; i <= 5; i++) {
+    const [x, y] = rot(k, -A + i, -A), dx = x - cam.x, dy = y - cam.y;
+    pts[k][i * 2] = dx * cr - dy * sr; pts[k][i * 2 + 1] = dx * sr + dy * cr;
+  }
+  const cx = W / 2, cy = H * .42;
+  const rStart = Math.max(0, Math.floor(camZ / L)), rEnd = rStart + VIEW_ROWS, pr = Math.floor(p.z / L);
+  const bridge = fx.bridge > 0, blink = fx.bridge < 1.5 && Math.floor(time * 10) % 2 === 0;
+  ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(8,9,26,.9)';
+  for (let r = rEnd; r >= rStart; r--) {
+    let z0 = r * L - camZ; const z1 = z0 + L;
+    if (z1 > NEAR) {
+      z0 = Math.max(z0, NEAR);
+      const s0 = F / z0, s1 = F / z1;
+      const fog = Math.pow(clamp(z1 / FOG, 0, 1), 1.25);
+      for (let k = 0; k < 4; k++) {
+        const f = (face + k) & 3, P = pts[k], base = FACE_RGB[f];
+        for (let c = 0; c < 5; c++) {
+          const real = tileAt(f, c, r);
+          if (!real && !bridge) continue;
+          if (real) {
+            const b = ((c + r) & 1 ? 1 : .8) * (1 - fog);
+            ctx.fillStyle = `rgb(${base[0] * b + BG[0] * fog | 0},${base[1] * b + BG[1] * fog | 0},${base[2] * b + BG[2] * fog | 0})`;
+          } else {
+            if (blink) continue;
+            ctx.fillStyle = `rgba(110,231,255,${.38 * (1 - fog)})`;
+          }
+          const ax = P[c * 2], ay = P[c * 2 + 1], bx = P[c * 2 + 2], by = P[c * 2 + 3];
+          ctx.beginPath();
+          ctx.moveTo(cx + ax * s0, cy - ay * s0); ctx.lineTo(cx + bx * s0, cy - by * s0);
+          ctx.lineTo(cx + bx * s1, cy - by * s1); ctx.lineTo(cx + ax * s1, cy - ay * s1);
+          ctx.closePath(); ctx.fill(); ctx.stroke();
+        }
+      }
+    }
+    if (r < rowItems.length) for (const it of rowItems[r]) if (!it.got) drawItem(it, r);
+    if (r === pr) drawPlayer();
+  }
+}
+
+function drawHud() {
+  ctx.textBaseline = 'top'; ctx.textAlign = 'left';
+  ctx.fillStyle = '#eef0ff'; ctx.font = '800 28px system-ui, sans-serif';
+  ctx.fillText(Math.floor(score).toLocaleString(), 20, 16);
+  ctx.fillStyle = '#9aa0c8'; ctx.font = '600 12px system-ui, sans-serif';
+  ctx.fillText('최고 ' + Math.max(best, Math.floor(score)).toLocaleString(), 21, 50);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#7df9ff'; ctx.font = '700 16px system-ui, sans-serif';
+  ctx.fillText('💎 ' + crystals, W - 20, 18);
+  let x = 20; ctx.textAlign = 'left';
+  const show = [];
+  if (fx.shield) show.push(['shield', 1]);
+  for (const k of ['bridge', 'magnet', 'slow', 'double']) if (fx[k] > 0) show.push([k, Math.min(1, fx[k] / POWER[k].time)]);
+  for (const [k, f] of show) {
+    const d = POWER[k];
+    ctx.fillStyle = 'rgba(10,12,40,.75)'; ctx.beginPath(); ctx.roundRect(x, 72, 92, 26, 13); ctx.fill();
+    ctx.fillStyle = d.color; ctx.globalAlpha = .4; ctx.beginPath(); ctx.roundRect(x, 72, 92 * f, 26, 13); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.fillStyle = '#fff'; ctx.font = '600 12px system-ui, sans-serif'; ctx.textBaseline = 'middle';
+    ctx.fillText(d.icon + ' ' + d.name, x + 9, 86); ctx.textBaseline = 'top';
+    x += 100;
+  }
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.font = '800 20px system-ui, sans-serif';
+  popups.forEach((q, i) => {
+    ctx.globalAlpha = clamp(1.1 - q.t, 0, 1); ctx.fillStyle = q.color;
+    ctx.fillText(q.text, W / 2, H * .3 - q.t * 40 - i * 26);
+  });
+  ctx.globalAlpha = 1;
+  if (flash > 0) { ctx.fillStyle = `rgba(255,255,255,${flash * .5})`; ctx.fillRect(0, 0, W, H); }
+}
+
+function overlay(title, sub, extra) {
+  ctx.fillStyle = 'rgba(6,7,22,.66)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#fff'; ctx.font = '800 42px system-ui, sans-serif'; ctx.fillText(title, W / 2, H * .38);
+  if (extra) { ctx.fillStyle = '#6ee7ff'; ctx.font = '700 19px system-ui, sans-serif'; ctx.fillText(extra, W / 2, H * .38 + 50); }
+  ctx.fillStyle = '#c8ccf0'; ctx.font = '600 16px system-ui, sans-serif';
+  ctx.globalAlpha = .6 + .4 * Math.sin(performance.now() / 300); ctx.fillText(sub, W / 2, H * .38 + 96); ctx.globalAlpha = 1;
+}
+
+function draw() {
+  drawBg(); drawTunnel(); drawHud();
+  if (state === 'ready') overlay('터널 러너 3D', '스페이스 또는 화면을 눌러 시작', '마우스나 ← → 로 벽을 타고, 클릭/스페이스로 점프');
+  else if (state === 'over') overlay('우주로 떨어졌어요', '다시 하려면 스페이스 / 터치',
+    Math.floor(score).toLocaleString() + '점 · 💎 ' + crystals + (Math.floor(score) >= best && best > 0 ? ' · 최고 기록!' : ''));
+  else if (paused) overlay('일시정지', '스페이스를 눌러 계속');
+}
+
+function loop(t) {
+  const dt = Math.min(.033, (t - t0) / 1000 || 0); t0 = t;
+  if (state === 'playing' && !paused) update(dt); else time += dt;
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
